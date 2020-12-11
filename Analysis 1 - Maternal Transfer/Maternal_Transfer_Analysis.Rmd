@@ -1,0 +1,1138 @@
+---
+title: "RTV Maternal Transfer Analysis"
+author: "Grant Brown"
+date: "12/11/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Introduction
+
+This document contains the code and raw output for the analysis concerning maternal uptake of the
+RTV intervention, as well as analysis of the uptake and maintenance of the vaccine in pups. 
+
+## Read in and Process Data
+
+
+```{r}
+suppressWarnings(suppressPackageStartupMessages({
+  library(dplyr)
+  library(splines)
+  library(rstan)
+  library(coda)
+  library(ggplot2)
+  library(knitr)
+  library(RColorBrewer)
+  library(openxlsx)
+}))
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores()-1)
+samples.mothers <- read.csv("mothers.csv") %>%
+  mutate(days = as.numeric(gsub("d", "", DaysPostVax)), 
+         day.idx = as.numeric(as.factor(days)))
+samples.mothers$Animal <- as.factor(samples.mothers$Animal)
+samples.mothers$Group <- with(samples.mothers, factor(ifelse(as.numeric(Animal) <= 10, "EcA", "Ec"), levels = c("EcA", "Ec")))
+
+# Update day labels for mothers
+samples.mothers$days <- ifelse(samples.mothers$days == 56, 54, samples.mothers$days)
+samples.mothers$days <- ifelse(samples.mothers$days == 133, 140, samples.mothers$days)
+
+
+cleanPupTime <- function(x){
+  cpt1 <- function(a){
+    # Clean up values that have days recorded
+    as.numeric(sapply(strsplit(x, "/wk"), function(x){gsub("d", "", x[[1]])}))
+  }
+  cpt2 <- function(a){
+    # Clean up values that only have weeks
+    7*as.numeric(gsub("wk", "", a))
+  }
+  suppressWarnings({
+    ifelse(x == "d1-birthday", 1, 
+    ifelse(grepl("d", x), cpt1(x), 
+    ifelse(grepl("wk",x), cpt2(x), "NA")))
+  })
+}
+
+lexicalnumeric <- function(x, suppress=TRUE){
+  sw <- ifelse(suppress[1], suppressWarnings, function(x){x})
+  sw(as.numeric(as.character(x)))
+}
+
+legendPlot <- function(...){
+  tryCatch({# Legend
+    par(xpd=TRUE)
+    par(bty="n")
+    par(xaxt="n")
+    par(yaxt="n")
+    plot(0,0,xlim=c(-10,10), ylim=c(-10,10),
+         type="n",xlab="",ylab="",main="")
+    legend(...)
+    }, 
+    finally = {
+      par(xaxt="s")
+      par(xaxt="s")
+      par(bty="o")
+      par(xpd=FALSE)
+    })
+}
+
+
+samples.pups <- read.csv("pups.csv") %>%
+  mutate(days = as.numeric(cleanPupTime(DaysPostVax)), 
+         day.idx = as.numeric(as.factor(days)))
+samples.pups$Animal <- as.factor(samples.pups$Animal)
+samples.pups$Group <- as.factor(samples.pups$Group)
+
+# For responses which are equal to zero, set them equal to the smallest nonzero value.
+# (zero just means below LOD)
+samples.pups$OD[(samples.pups$OD == 0)] <- min(setdiff(samples.pups$OD, 0))
+
+# Convert day/week tags to time indices
+
+```
+
+
+## Summaries
+
+```{r}
+
+
+p1.mothers <- ggplot(data = samples.mothers, 
+                     aes(x=days, y = OD, group = Animal, colour = Animal)) + 
+  ylab("OD Value") + 
+  ggtitle("Mothers - Vaccination Response") +
+  #theme_classic() + 
+  geom_point() + 
+  geom_line(aes(linetype=Group)) + labs(Animal = "Animal")
+  # + geom_vline(xintercept=c(21,35,56))
+suppressWarnings(print(p1.mothers))
+
+pdf(file = "MothersResponse.pdf", width = 8, height = 8)
+  suppressWarnings(print(p1.mothers))
+dev.off()
+
+
+
+
+
+p1.mothers.log <- function(legend=TRUE){
+uqEcA <- with(samples.mothers, unique(Animal[Group == "EcA"]))
+uqEc <- with(samples.mothers, unique(Animal[Group != "EcA"]))
+nEcA <- length(uqEcA)
+nEc <- length(uqEc)
+colors.EcA <- paste0(brewer.pal(9, "Blues")[3:9], "DD")
+colors.Ec <- paste0(brewer.pal(9, "Reds")[3:9], "DD")
+plwd <- 2
+pcex <- 2
+if(legend){
+  layout(matrix(1:2, nrow = 1), widths = c(6,2), heights = c(6,6))
+}
+plot(0,0, 
+     type = "n", 
+     main = "Mothers - Vaccination Response (Log Scale)",
+     xlim = range(samples.mothers$days),
+     ylim = range(log(samples.mothers$OD), na.rm=TRUE),
+     xlab = "Days", ylab = "log(OD) value"
+     )
+abline(h = seq(-10,10, by = 0.5), lty = 2, col = "lightgrey")
+abline(v = seq(0,1000, by = 14), lty = 2, col = "lightgrey")
+for (i in 1:nEc){
+  dsub <- samples.mothers[samples.mothers$Animal == uqEc[i],]
+  # Jitter to avoid overlap
+  e <- rnorm(1, 0, 1)
+  points(dsub$days+e, log(dsub$OD), pch = 2, 
+         col = colors.Ec[i %% length(colors.Ec)],
+         cex = pcex)
+  if (nrow(dsub) > 0){
+    # Don't let missings break lines
+    dsub <- dsub[!is.na(dsub$OD),]
+    lines(dsub$days+e, log(dsub$OD), 
+          col = colors.Ec[i %% length(colors.Ec)], 
+          lty=2, lwd = plwd)
+  }
+}
+
+for (i in 1:nEcA){
+  dsub <- samples.mothers[samples.mothers$Animal == uqEcA[i],]
+  
+  # Jitter to avoid overlap
+  e <- rnorm(1, 0, 1)
+  points(dsub$days+e, log(dsub$OD), pch = 1, 
+         col = colors.EcA[i %% length(colors.EcA)], 
+         cex = pcex)
+  if (nrow(dsub) > 0){
+    # Don't let missings break lines
+    dsub <- dsub[!is.na(dsub$OD),]
+    lines(dsub$days+e, log(dsub$OD), 
+          col = colors.EcA[i %% length(colors.EcA)], 
+          lwd = plwd)
+  }
+
+}
+
+
+if(legend){
+  legendPlot(x=-3,y=0, legend = c("EcA", "Ec"), lty = c(1,2),
+           lwd=c(2,2), pch =1:2, 
+           col = c(colors.EcA[6], colors.Ec[6]), cex = 1.5,
+           xjust=0.5, yjust=0.5)
+}
+}
+
+p1.mothers.log()
+
+pdf(file = "MothersResponseLog.pdf", width = 8, height = 8)
+  p1.mothers.log()
+dev.off()
+
+
+
+
+p1.pups <- ggplot(data = samples.pups, 
+                     aes(x=days, y = OD, group = Animal, colour = Animal)) + 
+  ylab("OD Value") + 
+  ggtitle("Pups - Vaccination Response") +
+  theme_classic() + 
+  geom_point() + 
+  geom_line(aes(linetype=Group)) + labs(Animal = "Animal") +
+  theme(legend.position = "none") 
+suppressWarnings(print(p1.pups))
+
+
+pdf(file = "PupsResponse.pdf", width = 8, height = 8)
+  suppressWarnings(print(p1.pups))
+dev.off()
+
+
+## Create Canvas Graphics version of this plot
+
+p1.pups.log <- function(legend = TRUE){
+uqEcA <- with(samples.pups, unique(Animal[Group == "EcA"]))
+uqEc <- with(samples.pups, unique(Animal[Group != "EcA"]))
+nEcA <- length(uqEcA)
+nEc <- length(uqEc)
+colors.EcA <- paste0(brewer.pal(9, "Blues")[3:9], "DD")
+colors.Ec <- paste0(brewer.pal(9, "Reds")[3:9], "DD")
+plwd <- 2
+pcex <- 2
+if(legend){
+  layout(matrix(1:2, nrow = 1), widths = c(6,2), heights = c(6,6))
+}  
+plot(0,0, 
+     type = "n", 
+     main = "Pups - Vaccination Response (Log Scale)",
+     xlim = range(samples.pups$days),
+     ylim = range(log(samples.pups$OD)),
+     xlab = "Days", ylab = "log(OD) value"
+     )
+abline(h = seq(-10,10, by = 0.5), lty = 2, col = "lightgrey")
+abline(v = seq(0,1000, by = 7), lty = 2, col = "lightgrey")
+for (i in 1:nEc){
+  dsub <- samples.pups[samples.pups$Animal == uqEc[i],]
+  # Jitter to avoid overlap
+  e <- rnorm(1, 0, 1)
+  points(dsub$days+e, log(dsub$OD), pch = 2, 
+         col = colors.Ec[i %% length(colors.Ec)],
+         cex = pcex)
+  if (nrow(dsub) > 0){
+    lines(dsub$days+e, log(dsub$OD), 
+          col = colors.Ec[i %% length(colors.Ec)], 
+          lty=2, lwd = plwd)
+  }
+}
+
+for (i in 1:nEcA){
+  dsub <- samples.pups[samples.pups$Animal == uqEcA[i],]
+  # Jitter to avoid overlap
+  e <- rnorm(1, 0, 1)
+  points(dsub$days+e, log(dsub$OD), pch = 1, 
+         col = colors.EcA[i %% length(colors.EcA)], 
+         cex = pcex)
+  if (nrow(dsub) > 0){
+    lines(dsub$days+e, log(dsub$OD), 
+          col = colors.EcA[i %% length(colors.EcA)], 
+          lwd = plwd)
+  }
+}
+
+
+if(legend){
+  legendPlot(x=-3,y=0, legend = c("EcA", "Ec"), lty = c(1,2),
+           lwd=c(2,2), pch =1:2, 
+           col = c(colors.EcA[6], colors.Ec[6]), cex = 1.5,
+           xjust=0.5, yjust=0.5)
+}
+}
+
+p1.pups.log()
+
+pdf(file = "PupsResponseLog.pdf", width = 8, height = 8)
+  p1.pups.log()
+dev.off()
+
+
+
+# Combine plots
+pdf(file="MothersPupsLog.pdf", width = 13, height = 6)
+layout(matrix(c(1,2,3), nrow=1), widths = c(6,6,2),
+       heights = c(6,6,6))
+p1.mothers.log(legend=FALSE)
+p1.pups.log(legend=FALSE)
+ legendPlot(x=-3,y=0, legend = c("EcA", "Ec"), lty = c(1,2),
+           lwd=c(2,2), pch =1:2, col = c(brewer.pal(9, "Blues")[7], brewer.pal(9, "Reds")[7]), 
+           cex = 1.5,
+           xjust=0.5, yjust=0.5)
+dev.off()
+
+```
+
+# Models
+
+## Mother Info
+
+```{r}
+samples.mothers <- mutate(samples.mothers, Ycomplete = ifelse(is.na(OD), -100, log(OD)),
+                          missingInd = is.na(OD))
+mothers.trt <- filter(samples.mothers, Group == "EcA") %>% arrange(Animal, days)
+mothers.ctl <- filter(samples.mothers, Group == "Ec") %>% arrange(Animal, days)
+
+X_trt <- cbind(1,
+               1*(mothers.trt$days/56)*(mothers.trt$days <= 56) + 1*(mothers.trt$days > 56), # Dosing
+               (mothers.trt$days-56)/365*(mothers.trt$days>56))      # Decay
+X_ctl <- cbind(1,
+               1*(mothers.ctl$days/56)*(mothers.ctl$days <= 56) + 1*(mothers.ctl$days > 56), # Dosing
+               (mothers.ctl$days-56)/365*(mothers.ctl$days>56))      # Decay
+
+afc <- function(x){as.factor(as.character(x))}
+
+Z_trt <- model.matrix(~afc(mothers.trt$Animal)-1)
+Z_ctl <- model.matrix(~afc(mothers.ctl$Animal)-1)
+
+# These aren't in column order due to character ordering of factors, 
+#   but the row indexing should be correct. 
+
+indices_trt <- t(apply(Z_trt, 2, function(x){
+  c(min(which(x > 0)), max(which(x > 0)))
+}))
+reidx.trt <- order(
+  as.numeric(
+    gsub("afc(mothers.trt$Animal)", "", 
+         rownames(indices_trt), 
+         fixed = TRUE)
+    )
+  )
+indices_trt <- indices_trt[reidx.trt,]
+rownames(indices_trt) <- 1:nrow(indices_trt)
+
+indices_ctl <- t(apply(Z_ctl, 2, function(x){
+  c(min(which(x > 0)), max(which(x > 0)))
+}))
+rownames(indices_ctl) <- gsub("afc(mothers.ctl$Animal)", "", 
+         rownames(indices_ctl), 
+         fixed = TRUE)
+reidx.ctl <- order(as.numeric(rownames(indices_ctl)))
+indices_ctl <- indices_ctl[reidx.ctl,]
+
+
+```
+
+```{r}
+
+
+# This function allows our trace plots to be tied to parameter names 
+tracePlot <- function(name,smpl,N=1000, ttl = "Traceplot"){
+  idx <- which(dimnames(smpl)$parameters == name)
+  s.idx <- round(seq(1, dim(smpl)[1], length = min(N, dim(smpl)[1])))
+  if (length(idx) != 1){
+    stop("Expected exactly one parameter with name ", name)
+  }
+  
+  plot(smpl[s.idx,1,idx], type = "l", col = rgb(0,0,0,0.5),
+       main=ttl, ylab = "Value", xlab = "Sampler Index")
+  lines(smpl[s.idx,2,idx], col = rgb(0,0,1,0.5))
+  lines(smpl[s.idx,3,idx], col = rgb(0,1,0.5,0.5))
+}
+
+#for (nm in dimnames(samples)$parameters){
+#  tracePlot(nm, samples, ttl=nm)  
+
+smrz <- function(smpz, nm){
+  parmat <- smpz[[nm]]
+  if (length(dim(parmat)) == 1){
+    dim(parmat) <- c(dim(parmat),1)
+  }
+  out <- Reduce("rbind", 
+                apply(parmat, 2, function(x){
+    round(data.frame(mean=mean(x), median=median(x), 
+               LB=quantile(x, probs = 0.025), 
+               UB = quantile(x, probs = 0.975),
+               PGT0 = mean(x>0)), 2)
+    
+          
+          
+  }))
+  rownames(out) <- paste(nm, 1:nrow(out))
+  out
+}
+
+
+smrz.d <- function(smpz, nm1,nm2,ttl=paste0(c(nm1," vs ", nm2), collapse = "")){
+  parmat1 <- smpz[[nm1]]
+  parmat2 <- smpz[[nm2]]
+  if (!all(dim(parmat1) == dim(parmat2))){
+    stop("Dimension mismatch")
+  }
+  if (length(dim(parmat1)) == 1){
+    dim(parmat1) <- c(dim(parmat1),1)
+    dim(parmat2) <- c(dim(parmat2),1)
+  }
+  parmatd <- parmat1-parmat2
+  out <- Reduce("rbind", 
+                apply(parmatd, 2, function(x){
+    round(data.frame(mean=mean(x), median=median(x), 
+               LB=quantile(x, probs = 0.025), 
+               UB = quantile(x, probs = 0.975),
+               pGT0 = mean(x>0)), 2)
+  }))
+  rownames(out) <- paste(ttl, 1:nrow(out))
+  out
+}
+
+```
+
+
+
+
+## Model: Relating Mothers to Pups
+
+This model extends the previous version by linking pups to mothers - both the group which was sampled at birth/day0, and those which were allowed to wean. 
+
+```{r}
+
+samples.pups <- arrange(samples.pups, Animal, days)
+
+pupIDs <- Reduce("rbind", 
+  lapply(strsplit(as.character(samples.pups$Animal),split=".",fixed=TRUE),
+       function(rw){
+         data.frame(mother=rw[1],
+                    pup = ifelse(length(rw)==2,rw[2], paste0(c(rw[2], rw[3]),collapse=".")))
+       })
+)
+
+samples.pups$Mother <- as.numeric(pupIDs$mother)
+samples.pups$wean_effect_active <- 0
+for (pp in unique(samples.pups$Animal)){
+  idx <- which(samples.pups[samples.pups$Animal == pp,]$days > 1)
+  if (length(idx)>0){
+    samples.pups$wean_effect_active[which((samples.pups$Animal == pp))[min(idx)]] <- 1
+  }
+}
+
+
+pups.trt <- filter(samples.pups, Group == "EcA") %>% arrange(Animal, days)
+pups.ctl <- filter(samples.pups, Group != "EcA") %>% arrange(Animal, days)
+# Let mother serve as index
+pups.ctl$Mother <- pups.ctl$Mother - 10
+
+# On the scale of mother ids. 
+treatment_d56 <- which(mothers.trt$DaysPostVax=="d56")
+control_d56 <- which(mothers.ctl$DaysPostVax=="d56")
+
+
+# Identify indices
+Z_trt_pups <- model.matrix(~afc(pups.trt$Animal)-1)
+indices_trt_pups <- t(apply(Z_trt_pups, 2, function(x){
+  c(min(which(x > 0)), max(which(x > 0)))
+}))
+#reidx.trt <- order(
+#  as.numeric(
+#    gsub("afc(pups.trt$Animal)", "", 
+#         rownames(indices_trt_pups), 
+#         fixed = TRUE)
+#    )
+#  )
+#indices_trt_pups <- indices_trt_pups[reidx.trt,]
+rownames(indices_trt_pups) <- 1:nrow(indices_trt_pups)
+
+
+
+Z_ctl_pups <- model.matrix(~afc(pups.ctl$Animal)-1)
+indices_ctl_pups <- t(apply(Z_ctl_pups, 2, function(x){
+  c(min(which(x > 0)), max(which(x > 0)))
+}))
+#reidx.ctl <- order(
+#  as.numeric(
+#    gsub("afc(pups.ctl$Animal)", "", 
+#         rownames(indices_ctl_pups), 
+#         fixed = TRUE)
+#    )
+#  )
+#indices_ctl_pups <- indices_ctl_pups[reidx.ctl,]
+rownames(indices_ctl_pups) <- 1:nrow(indices_ctl_pups)
+
+pups_ctl_have_longitudinal <- which(apply(indices_ctl_pups, 1, var) != 0)
+pups_trt_have_longitudinal <- which(apply(indices_trt_pups, 1, var) != 0)
+
+
+X_trt_pups <- cbind(1, #Intercept
+                    pups.trt$days*(pups.trt$days > 1)/max(pups.trt$days) # Decay
+               ) 
+X_ctl_pups <- cbind(1, #Intercept
+                    pups.ctl$days*(pups.ctl$days > 1)/max(pups.ctl$days) # Decay
+               ) 
+
+
+stan.data2 <- list(N_trt = nrow(mothers.trt),
+                  N_ctl = nrow(mothers.ctl),
+                  K = ncol(X_trt),
+                  Nsubj_trt = length(unique(mothers.trt$Animal)),
+                  Nsubj_ctl = length(unique(mothers.ctl$Animal)), 
+                  start_idx_trt = indices_trt[,1],
+                  stop_idx_trt = indices_trt[,2],
+                  start_idx_ctl = indices_ctl[,1],
+                  stop_idx_ctl = indices_ctl[,2],
+                  X_trt = X_trt,
+                  X_ctl = X_ctl,
+                  Y_trt = mothers.trt$Ycomplete,
+                  Y_ctl = mothers.ctl$Ycomplete,
+                  missing_N_trt = sum(is.na(mothers.trt$OD)),
+                  missing_N_ctl = sum(is.na(mothers.ctl$OD)),
+                  missing_idx_trt =  as.array(which(is.na(mothers.trt$OD))),
+                  missing_idx_ctl =  as.array(which(is.na(mothers.ctl$OD))),
+                  # Info on pups
+                  N_trt_pups = nrow(pups.trt),
+                  N_ctl_pups = nrow(pups.ctl),
+                  K_pups = ncol(X_trt_pups),
+                  Nsubj_trt_pups = length(unique(pups.trt$Animal)),
+                  Nsubj_ctl_pups = length(unique(pups.ctl$Animal)), 
+                  start_idx_trt_pups = indices_trt_pups[,1],
+                  stop_idx_trt_pups = indices_trt_pups[,2],
+                  start_idx_ctl_pups = indices_ctl_pups[,1],
+                  stop_idx_ctl_pups = indices_ctl_pups[,2],
+                  X_trt_pups = X_trt_pups,
+                  X_ctl_pups = X_ctl_pups,
+                  Y_trt_pups = log(pups.trt$OD),
+                  Y_ctl_pups = log(pups.ctl$OD),
+                  pup_mother_idx_trt = pups.trt$Mother,
+                  pup_mother_idx_ctl = pups.ctl$Mother,
+                  dose_idx_trt_pups = treatment_d56,
+                  dose_idx_ctl_pups = control_d56,
+                  dose_connected_trt_pups = pups.trt$wean_effect_active,
+                  dose_connected_ctl_pups = pups.ctl$wean_effect_active,
+                  N_pups_trt_with_longitudinal = length(pups_trt_have_longitudinal),
+                  N_pups_ctl_with_longitudinal = length(pups_ctl_have_longitudinal),
+                  pups_trt_have_longitudinal=pups_trt_have_longitudinal,
+                  pups_ctl_have_longitudinal=pups_ctl_have_longitudinal
+                  )
+
+
+
+#table(as.character(mothers.trt$Animal),mothers.trt$DaysPostVax == "d56")
+#table(as.character(mothers.ctl$Animal),mothers.ctl$DaysPostVax == "d56")
+
+
+
+
+
+
+stan.model.mothers.pups <- "
+data {
+  ///////// Terms for mothers
+  int<lower=0> N_trt; // Number of Observations
+  int<lower=0> N_ctl; // Number of Observations
+  
+  int<lower=0> missing_N_trt; // Number of missing observations for treatment. 
+  int<lower=0> missing_N_ctl; // Number of missing observations for treatment. 
+  
+  int<lower=0> missing_idx_trt[missing_N_trt];
+  int<lower=0> missing_idx_ctl[missing_N_ctl];
+  
+  int<lower=0> K; // Number of columns of design matrix
+  
+  int<lower=0> Nsubj_trt; // Number of Subjects
+  int<lower=0> Nsubj_ctl; // Number of Subjects
+  
+  int<lower=0> start_idx_trt[Nsubj_trt];  // Index of starting values for subjects
+  int<lower=0> stop_idx_trt[Nsubj_trt];   // Index of stopping values for subjects
+    
+  int<lower=0> start_idx_ctl[Nsubj_ctl];  // Index of starting values for subjects
+  int<lower=0> stop_idx_ctl[Nsubj_ctl];   // Index of stopping values for subjects
+  
+  matrix[N_trt, K] X_trt; // Design matrix
+  matrix[N_ctl, K] X_ctl; // Design matrix
+  
+  real Y_trt[N_trt];      // Outcome
+  real Y_ctl[N_ctl];      // Outcome
+  
+  ///////// Terms for pups /////////
+  
+  int<lower=0> N_trt_pups; // Number of Observations
+  int<lower=0> N_ctl_pups; // Number of Observations
+  int<lower=0> K_pups; // Number of columns of design matrix
+  int<lower=0> Nsubj_trt_pups; // Number of Subjects
+  int<lower=0> Nsubj_ctl_pups; // Number of Subjects
+  
+  int<lower=0> start_idx_trt_pups[Nsubj_trt_pups];  // Index of starting values for subjects
+  int<lower=0> stop_idx_trt_pups[Nsubj_trt_pups];   // Index of stopping values for subjects
+    
+  int<lower=0> start_idx_ctl_pups[Nsubj_ctl_pups];  // Index of starting values for subjects
+  int<lower=0> stop_idx_ctl_pups[Nsubj_ctl_pups];   // Index of stopping values for subjects
+    
+  matrix[N_trt_pups, K_pups] X_trt_pups; // Design matrix
+  matrix[N_ctl_pups, K_pups] X_ctl_pups; // Design matrix
+  
+  real Y_trt_pups[N_trt_pups];      // Outcome
+  real Y_ctl_pups[N_ctl_pups];      // Outcome
+  
+  int<lower=0> pup_mother_idx_trt[N_trt_pups];
+  int<lower=0> pup_mother_idx_ctl[N_ctl_pups];
+  
+  int<lower=0> dose_connected_trt_pups[N_trt_pups];
+  int<lower=0> dose_connected_ctl_pups[N_ctl_pups];
+  
+  int<lower=0> dose_idx_trt_pups[Nsubj_trt]; // Dose connection to mother serum
+  int<lower=0> dose_idx_ctl_pups[Nsubj_ctl]; // Dose connection to mother serum
+  
+  // Track which pup indices are assocaited with longitudinal data (to apply autocorr)
+  int <lower=0> N_pups_trt_with_longitudinal;
+  int <lower=0> N_pups_ctl_with_longitudinal;
+  int<lower=0> pups_trt_have_longitudinal[N_pups_trt_with_longitudinal];
+  int<lower=0> pups_ctl_have_longitudinal[N_pups_ctl_with_longitudinal];
+}
+parameters {
+  // Mothers //
+  vector[K] beta_trt_pop;
+  vector[K] beta_ctl_pop;
+  
+  real ymiss_trt[missing_N_trt];
+  real ymiss_ctl[missing_N_ctl];
+  
+  real<lower=0,upper=1> rho_trt;
+  real<lower=0,upper=1> rho_ctl;
+  
+  real<lower=0> sigma_Y_trt;
+  real<lower=0> sigma_Y_ctl;
+  
+  // Pups //
+  // Main Coefficients
+  vector[K_pups] beta_trt_pups;
+  vector[K_pups] beta_ctl_pups;
+  // weaning term
+  real gamma_trt;
+  real gamma_ctl;
+  // Autocorrelation terms
+  real<lower=0,upper=1> rho_trt_pups;
+  real<lower=0,upper=1> rho_ctl_pups;
+  // Variance Terms
+  real<lower=0> sigma_Y_trt_pups;
+  real<lower=0> sigma_Y_ctl_pups;
+  
+}
+transformed parameters{
+  vector[N_trt] yall_trt = to_vector(Y_trt);
+  vector[N_ctl] yall_ctl = to_vector(Y_ctl);
+  vector[N_trt] eta_trt;
+  vector[N_ctl] eta_ctl;
+  
+  vector[N_trt] mu_trt;
+  vector[N_ctl] mu_ctl;
+  
+  vector[N_trt_pups] eta_trt_pups;
+  vector[N_ctl_pups] eta_ctl_pups;
+  
+  vector[N_trt_pups] mu_trt_pups;
+  vector[N_ctl_pups] mu_ctl_pups;
+  
+  
+  for (i in 1:missing_N_trt){
+    yall_trt[missing_idx_trt[i]] = ymiss_trt[i];
+  }
+  for (i in 1:missing_N_ctl){
+    yall_ctl[missing_idx_ctl[i]] = ymiss_ctl[i];
+  }
+  
+  // Compute eta for Mothers and Pups
+  eta_trt = X_trt*beta_trt_pop;
+  eta_ctl = X_ctl*beta_ctl_pop;
+  
+  eta_trt_pups = X_trt_pups*beta_trt_pups;
+  eta_ctl_pups = X_ctl_pups*beta_ctl_pups;
+  
+  
+  // Apply weaning Term from Mothers to Pups
+  
+  for (i in 1:Nsubj_trt_pups){
+    for (j in (start_idx_trt_pups[i]):stop_idx_trt_pups[i]){
+      eta_trt_pups[j] = eta_trt_pups[j] + gamma_trt*dose_connected_trt_pups[j]*Y_trt[dose_idx_trt_pups[pup_mother_idx_trt[j]]];
+    }
+  }
+  for (i in 1:Nsubj_ctl_pups){
+    for (j in (start_idx_ctl_pups[i]):stop_idx_ctl_pups[i]){
+      eta_ctl_pups[j] = eta_ctl_pups[j] + gamma_ctl*dose_connected_ctl_pups[j]*Y_ctl[dose_idx_ctl_pups[pup_mother_idx_ctl[j]]];
+    }
+  }
+  
+  // Apply Autoregression (mothers)
+  for (i in 1:Nsubj_trt){
+    mu_trt[start_idx_trt[i]] = eta_trt[start_idx_trt[i]];
+    for (j in (start_idx_trt[i]+1):stop_idx_trt[i]){
+      mu_trt[j] = eta_trt[j] + rho_trt*yall_trt[j-1];
+    }
+  }
+  
+  for (i in 1:Nsubj_ctl){
+    mu_ctl[start_idx_ctl[i]] = eta_ctl[start_idx_ctl[i]];
+    for (j in (start_idx_ctl[i]+1):stop_idx_ctl[i]){
+      mu_ctl[j] = eta_ctl[j] + rho_ctl*yall_ctl[j-1];
+    }
+  }
+
+  // Apply Autoregression (pups)
+  mu_trt_pups = eta_trt_pups;
+  mu_ctl_pups = eta_ctl_pups;
+  for (i in 1:N_pups_trt_with_longitudinal){
+    mu_trt_pups[start_idx_trt_pups[pups_trt_have_longitudinal[i]]] = eta_trt_pups[start_idx_trt_pups[pups_trt_have_longitudinal[i]]];
+    for (j in (start_idx_trt_pups[pups_trt_have_longitudinal[i]]+1):stop_idx_trt_pups[pups_trt_have_longitudinal[i]]){
+      mu_trt_pups[j] = eta_trt_pups[j] + rho_trt_pups*Y_trt_pups[j-1];
+    }
+  }
+  for (i in 1:N_pups_ctl_with_longitudinal){
+    mu_ctl_pups[start_idx_ctl_pups[pups_ctl_have_longitudinal[i]]] = eta_ctl_pups[start_idx_ctl_pups[pups_ctl_have_longitudinal[i]]];
+    for (j in (start_idx_ctl_pups[pups_ctl_have_longitudinal[i]]+1):stop_idx_ctl_pups[pups_ctl_have_longitudinal[i]]){
+      mu_ctl_pups[j] = eta_ctl_pups[j] + rho_ctl_pups*Y_ctl_pups[j-1];
+    }
+  }
+  
+}
+model{
+  // Likelihood for treatment group animals (mothers)
+  yall_trt ~ normal(mu_trt, sigma_Y_trt);
+  yall_ctl ~ normal(mu_ctl, sigma_Y_ctl);
+  Y_trt_pups ~ normal(mu_trt_pups, sigma_Y_trt_pups);
+  Y_ctl_pups ~ normal(mu_ctl_pups, sigma_Y_ctl_pups);
+
+  // Priors
+  beta_ctl_pop ~ normal(0, 10);
+  beta_trt_pop ~ normal(0, 10);
+  beta_ctl_pups ~ normal(0, 10);
+  beta_trt_pups ~ normal(0, 10);
+  sigma_Y_trt ~ gamma(1,1);
+  sigma_Y_ctl ~ gamma(1,1);
+  sigma_Y_trt_pups ~ gamma(1,1);
+  sigma_Y_ctl_pups ~ gamma(1,1);
+  rho_trt ~ beta(1,1);
+  rho_ctl ~ beta(1,1);
+  rho_trt_pups ~ beta(1,1);
+  rho_ctl_pups ~ beta(1,1);
+  gamma_trt ~ normal(0,1);
+  gamma_ctl ~ normal(0,1);
+}
+"
+
+```
+
+Fit the model:
+
+```{r}
+
+if (!file.exists("mothers_pups_model.rda")){
+  result2 <- stan(model_code = stan.model.mothers.pups, 
+                     data = stan.data2,
+                     chain = 3,
+                     iter = 30000,
+                     warmup = 25000,
+                     pars = c("beta_trt_pop", 
+                              "beta_ctl_pop",
+                              "beta_trt_pups", 
+                              "beta_ctl_pups",
+                              "sigma_Y_trt",
+                              "sigma_Y_ctl",
+                              "sigma_Y_trt_pups",
+                              "sigma_Y_ctl_pups",
+                              "mu_trt",
+                              "mu_ctl",
+                              "mu_trt_pups",
+                              "mu_ctl_pups",
+                              "rho_trt",
+                              "rho_ctl",
+                              "rho_trt_pups",
+                              "rho_ctl_pups",
+                              "gamma_trt",
+                              "gamma_ctl"),verbose = TRUE,control = list(adapt_delta=0.95))
+  save("result2", file = "mothers_pups_model.rda")
+} else{
+  load("mothers_pups_model.rda")
+}
+
+samples <- extract(result2, permute=FALSE)
+
+mcl <- as.mcmc.list(list(as.mcmc(samples[,1,]), 
+                         as.mcmc(samples[,2,]),
+                         as.mcmc(samples[,3,])))
+gd <- gelman.diag(mcl, multivariate = FALSE)
+max(gd$psrf[,1])
+
+samples2 <- extract(result2)
+
+
+```
+
+
+
+## Summarize Model 2
+
+```{r}
+
+effect_tbl1 <- (Reduce("rbind", list(
+  smrz(samples2, "beta_trt_pop"),
+  smrz(samples2, "beta_ctl_pop"),
+  smrz(samples2, "beta_trt_pups"),
+  smrz(samples2, "beta_ctl_pups"),
+  smrz(samples2, "rho_trt"),
+  smrz(samples2, "rho_ctl"),
+  smrz(samples2, "rho_trt_pups"),
+  smrz(samples2, "rho_ctl_pups"),
+  smrz(samples2, "gamma_trt"),
+  smrz(samples2, "gamma_ctl"))))
+kable(effect_tbl1)
+
+effect_tbl1 <- data.frame(Parameter = rownames(effect_tbl1), 
+                          MeanCrI = paste0(effect_tbl1[,1], " ", paste0("(", effect_tbl1[,3], ", ", effect_tbl1[,4], ")")), 
+                          PGT0 = effect_tbl1[, 5], 
+                          PLT0 = 1-effect_tbl1[, 5])
+                          
+
+
+write.xlsx(effect_tbl1, file = "MothersPupsEffectTable1.xlsx",quote=FALSE)
+cat(kable(effect_tbl1, format = "latex"), file = "MothersPupsEffectTable1.txt")
+
+
+effect_tbl2 <- (Reduce("rbind", list(  
+  smrz.d(samples2, "beta_trt_pop", "beta_ctl_pop", "beta diff (TvC) "),
+  smrz.d(samples2, "beta_trt_pups", "beta_ctl_pups", "pups beta diff (TvC) "),
+  smrz.d(samples2, "rho_trt", "rho_ctl", "rho diff (TvC) "),
+  smrz.d(samples2, "rho_trt_pups", "rho_ctl_pups", "pups rho diff (TvC) "),
+  smrz.d(samples2, "gamma_trt", "gamma_ctl", "gamma (pups) diff (TvC) "))))
+
+
+effect_tbl2 <- data.frame(ParameterDiff = rownames(effect_tbl2), 
+                          MeanCrI = paste0(effect_tbl2[,1], " ", paste0("(", effect_tbl2[,3], ", ", effect_tbl2[,4], ")")), 
+                          PGT0 = effect_tbl2[, 5], 
+                          PLT0 = 1-effect_tbl2[, 5])
+          
+
+
+kable(effect_tbl2)
+write.xlsx(effect_tbl2, file = "MothersPupsEffectTable2.xlsx",quote=FALSE)
+cat(kable(effect_tbl2, format = "latex"), file = "MothersPupsEffectTable2.txt")
+
+
+```
+
+
+
+```{r}
+
+mothers.result <- Reduce("rbind", 
+                         lapply(unique(samples.mothers$days), function(d){
+  idx1 <- mothers.trt$days == d
+  idx2 <- mothers.ctl$days == d
+  
+  e1 <- samples2$mu_trt[,idx1]
+  e2 <- samples2$mu_ctl[,idx2]
+  A <- mean(sample(e1, size = 50000, replace = TRUE) > 
+            sample(e2, size = 50000, replace = TRUE))
+  
+  data.frame(days = d, 
+             P_EcA_Greater = A, 
+             EcA_LB = quantile(e1, probs=c(0.025)),
+             EcA_UB = quantile(e1, probs=c(0.975)),
+             EcA_median = median(e1),
+             
+             Ec_LB = quantile(e2, probs=c(0.025)),
+             Ec_UB = quantile(e2, probs=c(0.975)),
+             Ec_median = median(e2))
+}))
+
+
+pups.result <- Reduce("rbind", 
+                         lapply(unique(samples.pups$days), function(d){
+  idx1 <- pups.trt$days == d
+  idx2 <- pups.ctl$days == d
+  
+  e1 <- samples2$mu_trt_pups[,idx1]
+  e2 <- samples2$mu_ctl_pups[,idx2]
+  A <- mean(sample(e1, size = 50000, replace = TRUE) > 
+            sample(e2, size = 50000, replace = TRUE))
+  
+  data.frame(days = d, 
+             P_EcA_Greater = A, 
+             EcA_LB = quantile(e1, probs=c(0.025)),
+             EcA_UB = quantile(e1, probs=c(0.975)),
+             EcA_median = median(e1),
+             
+             Ec_LB = quantile(e2, probs=c(0.025)),
+             Ec_UB = quantile(e2, probs=c(0.975)),
+             Ec_median = median(e2))
+}))
+
+
+pups.result <- Reduce("rbind", 
+                         lapply(unique(samples.pups$days), function(d){
+  idx1 <- pups.trt$days == d
+  idx2 <- pups.ctl$days == d
+  
+  e1 <- samples2$mu_trt_pups[,idx1]
+  e2 <- samples2$mu_ctl_pups[,idx2]
+  D <- sample(e1, size = 50000, replace = TRUE) - sample(e2, size = 50000, replace = TRUE)
+  A <- mean(D > 0)
+  
+  data.frame(days = d, 
+             P_EcA_Greater = A, 
+             TvC = mean(D),
+             TvC_LB = quantile(D, probs = c(0.025)),
+             TvC_UB = quantile(D, probs = c(0.975)),
+             EcA_LB = quantile(e1, probs=c(0.025)),
+             EcA_UB = quantile(e1, probs=c(0.975)),
+             EcA_median = median(e1),
+             
+             Ec_LB = quantile(e2, probs=c(0.025)),
+             Ec_UB = quantile(e2, probs=c(0.975)),
+             Ec_median = median(e2))
+}))
+
+
+pups.result <- arrange(pups.result, days)
+
+## Mothers plot (from Joint model)
+
+
+plot(mothers.result$days, exp(mothers.result$EcA_median), xlab = "Days", 
+     ylab = "Treatment Mean", main = "Estimated Group Trajectories", type = "b", col = "blue", lwd = 2, ylim = c(0,4))
+lines(mothers.result$days, exp(mothers.result$EcA_LB), lty = 2, col = "blue")
+lines(mothers.result$days, exp(mothers.result$EcA_UB), lty = 2, col = "blue")
+
+points(mothers.result$days, exp(mothers.result$Ec_median), col = "red", pch = 2)
+lines(mothers.result$days, exp(mothers.result$Ec_median), lwd = 2, col = "red")
+lines(mothers.result$days, exp(mothers.result$Ec_LB), lty = 2, col = "red")
+lines(mothers.result$days, exp(mothers.result$Ec_UB), lty = 2, col = "red")
+
+abline(h = seq(0,10,0.5), lty = 2, col = "lightgrey")
+legend(x=150, y = 3, legend = c("EcA", "Ec"), col = c("blue", "red"), lty = c(1,1),
+       lwd = c(2,2))
+
+pdf(file = "MothersEstimatedGroupTrajectories.pdf", width =8,height=8)
+  plot(mothers.result$days, exp(mothers.result$EcA_median), xlab = "Days", 
+       ylab = "Treatment Mean", main = "Estimated Group Trajectories - Mothers", type = "b", col = "blue", lwd = 2, ylim = c(0,4))
+  lines(mothers.result$days, exp(mothers.result$EcA_LB), lty = 2, col = "blue")
+  lines(mothers.result$days, exp(mothers.result$EcA_UB), lty = 2, col = "blue")
+  
+  points(mothers.result$days, exp(mothers.result$Ec_median), col = "red", pch = 2)
+  lines(mothers.result$days, exp(mothers.result$Ec_median), lwd = 2, col = "red")
+  lines(mothers.result$days, exp(mothers.result$Ec_LB), lty = 2, col = "red")
+  lines(mothers.result$days, exp(mothers.result$Ec_UB), lty = 2, col = "red")
+  
+  abline(h = seq(0,10,0.5), lty = 2, col = "lightgrey")
+  legend(x=150, y = 3, legend = c("EcA", "Ec"), col = c("blue", "red"), lty = c(1,1),
+         lwd = c(2,2))
+dev.off()
+
+plot(pups.result$days, exp(pups.result$EcA_median), xlab = "Days", 
+     ylab = "Treatment Mean", main = "Estimated Group Trajectories\n (Pups)", type = "b", col = "blue", lwd = 2, ylim = c(0,4))
+lines(pups.result$days, exp(pups.result$EcA_LB), lty = 2, col = "blue")
+lines(pups.result$days, exp(pups.result$EcA_UB), lty = 2, col = "blue")
+
+points(pups.result$days, exp(pups.result$Ec_median), col = "red", pch = 2)
+lines(pups.result$days, exp(pups.result$Ec_median), lwd = 2, col = "red")
+lines(pups.result$days, exp(pups.result$Ec_LB), lty = 2, col = "red")
+lines(pups.result$days, exp(pups.result$Ec_UB), lty = 2, col = "red")
+
+abline(h = seq(0,10,0.5), lty = 2, col = "lightgrey")
+legend(x=125, y = 2.5, legend = c("EcA", "Ec"), col = c("blue", "red"), lty = c(1,1),
+       lwd = c(2,2))
+
+## Create image file
+
+
+
+
+pdf(file = "PupsEstimatedGroupTrajectories.pdf", width =8,height=8)
+  
+  plot(pups.result$days, exp(pups.result$EcA_median), xlab = "Days", 
+       ylab = "Treatment Mean", main = "Estimated Group Trajectories\n (Pups)", type = "b", col = "blue", lwd = 2, ylim = c(0,4))
+  lines(pups.result$days, exp(pups.result$EcA_LB), lty = 2, col = "blue")
+  lines(pups.result$days, exp(pups.result$EcA_UB), lty = 2, col = "blue")
+  
+  points(pups.result$days, exp(pups.result$Ec_median), col = "red", pch = 2)
+  lines(pups.result$days, exp(pups.result$Ec_median), lwd = 2, col = "red")
+  lines(pups.result$days, exp(pups.result$Ec_LB), lty = 2, col = "red")
+  lines(pups.result$days, exp(pups.result$Ec_UB), lty = 2, col = "red")
+  
+  abline(h = seq(0,10,0.5), lty = 2, col = "lightgrey")
+  legend(x=125, y = 2.5, legend = c("EcA", "Ec"), col = c("blue", "red"), lty = c(1,1),
+         lwd = c(2,2))
+dev.off()
+
+plot(pups.result$days, pups.result$P_EcA_Greater, xlab = "Days", 
+     ylab = "Probability Treatment > Control", main = "Evidence of Treatment Effect - Overall", type = "b", col = "blue", lwd = 2)
+abline(h = seq(0,1,0.1), lty = 2, col = "lightgrey")
+
+pdf(file = "PupsEvidenceTreatmentEffect.pdf", width = 8, height =8)
+  plot(pups.result$days, pups.result$P_EcA_Greater, xlab = "Days", 
+       ylab = "Probability Treatment > Control", main = "Evidence of Treatment Effect - Overall", type = "b", col = "blue", lwd = 2)
+  abline(h = seq(0,1,0.1), lty = 2, col = "lightgrey")
+dev.off()
+
+## Combined Mother/Pup Plot
+
+
+
+
+# Combine plots
+pdf(file="MothersPupsEstimatedGroupTrajectories.pdf", width = 13, height = 6)
+layout(matrix(c(1,2,3), nrow=1), widths = c(6,6,2),
+       heights = c(6,6,6))
+  # Mother Plot
+  plot(mothers.result$days, exp(mothers.result$EcA_median), xlab = "Days", 
+       ylab = "Treatment Mean", main = "Estimated Group Trajectories - Mothers", type = "b", col = "blue", lwd = 2, ylim = c(0,4))
+  lines(mothers.result$days, exp(mothers.result$EcA_LB), lty = 2, col = "blue")
+  lines(mothers.result$days, exp(mothers.result$EcA_UB), lty = 2, col = "blue")
+  
+  points(mothers.result$days, exp(mothers.result$Ec_median), col = "red", pch = 2)
+  lines(mothers.result$days, exp(mothers.result$Ec_median), lwd = 2, col = "red")
+  lines(mothers.result$days, exp(mothers.result$Ec_LB), lty = 2, col = "red")
+  lines(mothers.result$days, exp(mothers.result$Ec_UB), lty = 2, col = "red")
+  
+  abline(h = seq(0,10,0.25), lty = 2, col = "lightgrey")
+  # Pups Plot
+  
+  plot(pups.result$days, exp(pups.result$EcA_median), xlab = "Days", 
+       ylab = "Treatment Mean", main = "Estimated Group Trajectories - Pups", type = "b", col = "blue", lwd = 2, ylim = c(0,4))
+  lines(pups.result$days, exp(pups.result$EcA_LB), lty = 2, col = "blue")
+  lines(pups.result$days, exp(pups.result$EcA_UB), lty = 2, col = "blue")
+  
+  points(pups.result$days, exp(pups.result$Ec_median), col = "red", pch = 2)
+  lines(pups.result$days, exp(pups.result$Ec_median), lwd = 2, col = "red")
+  lines(pups.result$days, exp(pups.result$Ec_LB), lty = 2, col = "red")
+  lines(pups.result$days, exp(pups.result$Ec_UB), lty = 2, col = "red")
+  
+  abline(h = seq(0,10,0.25), lty = 2, col = "lightgrey")
+  
+  
+ legendPlot(x=-3,y=0, legend = c("EcA", "Ec"), lty = c(1,2),
+           lwd=c(2,2), pch =1:2, col = c("blue", "red"), 
+           cex = 1.5,
+           xjust=0.5, yjust=0.5)
+dev.off()
+
+
+
+```
+
+Combined/overlaid plot
+
+
+```{r}
+
+ci.lwd <- 2
+pdf(file="MothersPupsEstimatedGroupTrajectories_V2.pdf", width = 9, height = 6)
+colors.EcA <- paste0(brewer.pal(4, "Dark2")[c(1,3)], "FF")
+colors.Ec <- paste0(brewer.pal(4, "Dark2")[c(2,4)], "FF")
+pch.mother.EcA <- 1
+pch.mother.Ec <- 2
+pch.pup.EcA <- 16
+pch.pup.Ec <- 17
+# Mother Plot
+layout(matrix(1:2, nrow = 1), widths = c(6,2), heights = c(6,6))
+plot(mothers.result$days, exp(mothers.result$EcA_median), xlab = "Days", 
+     ylab = "Treatment Mean", main = "Estimated Group Trajectories\n Mothers and Pups (95% Cr-I)", type = "n", lwd = 2, ylim = c(0,4), col = colors.EcA[1], 
+     pch = pch.mother.EcA)
+
+abline(h = seq(0,10,0.25), lty = 2, col = "lightgrey")
+points(mothers.result$days, exp(mothers.result$EcA_median),
+     col = colors.EcA[1], 
+     pch = pch.mother.EcA)
+lines(mothers.result$days, exp(mothers.result$EcA_median),
+      col = colors.EcA[1], lwd = 2)
+lines(mothers.result$days, exp(mothers.result$EcA_LB), lty = 2,
+      col = colors.EcA[1], lwd = ci.lwd)
+lines(mothers.result$days, exp(mothers.result$EcA_UB), lty = 2, 
+      col = colors.EcA[1], lwd = ci.lwd)
+
+points(mothers.result$days, exp(mothers.result$Ec_median), col = colors.Ec[1], 
+       pch = pch.mother.Ec)
+lines(mothers.result$days, exp(mothers.result$Ec_median), lwd = 2, col = colors.Ec[1])
+lines(mothers.result$days, exp(mothers.result$Ec_LB), lty = 2, col = colors.Ec[1], lwd = ci.lwd)
+lines(mothers.result$days, exp(mothers.result$Ec_UB), lty = 2, col = colors.Ec[1], lwd = ci.lwd)
+
+
+# Pups Plot
+
+
+points(pups.result$days+75, exp(pups.result$EcA_median), col = colors.EcA[2], pch = pch.pup.EcA)
+lines(pups.result$days+75, exp(pups.result$EcA_median),lwd = 2, col = colors.EcA[2])
+lines(pups.result$days+75, exp(pups.result$EcA_LB), lty = 3, col = colors.EcA[2], lwd = ci.lwd)
+lines(pups.result$days+75, exp(pups.result$EcA_UB), lty = 3, col = colors.EcA[2], lwd = ci.lwd)
+
+points(pups.result$days+75, exp(pups.result$Ec_median), col = colors.Ec[2], pch = pch.pup.Ec,
+       bg = colors.Ec[2])
+lines(pups.result$days+75, exp(pups.result$Ec_median), lwd = 2, col = colors.Ec[2])
+lines(pups.result$days+75, exp(pups.result$Ec_LB), lty = 3, col = colors.Ec[2], lwd = ci.lwd)
+lines(pups.result$days, exp(pups.result$Ec_UB), lty = 3, col = colors.Ec[2], lwd = ci.lwd)
+
+legendPlot(x=-3,y=0, legend = c("EcA Mothers", "EcA Pups", "Ec mothers", "Ec Pups"), lty = c(1,1,1,1), col = c(colors.EcA, colors.Ec), lwd = c(2,2,2,2), pch = c(pch.mother.EcA, pch.pup.EcA, pch.mother.Ec, pch.pup.Ec),
+         cex = 1.5,
+         xjust=0.5, yjust=0.5, bty= "n")
+dev.off()
+```
+
+## V3 plot
+
+```{r}
+
+
+# Combine plots
+pdf(file="MothersPupsEstimatedGroupTrajectories_v3.pdf", width = 8, height = 8)
+  layout(matrix(c(1,2), nrow=2), widths = c(6,6),
+       heights = c(4,4))
+  # Mother Plot
+  plot(mothers.result$days, exp(mothers.result$EcA_median), xlab = "Days", 
+       ylab = "Treatment Mean", main = "Estimated Group Trajectories - Mothers", type = "b", col = "blue", lwd = 2, ylim = c(0,4), xlim = c(0,220))
+  abline(h = seq(0,10,0.5), lty = 2, col = "lightgrey")
+  lines(mothers.result$days, exp(mothers.result$EcA_LB), lty = 2, col = "blue")
+  lines(mothers.result$days, exp(mothers.result$EcA_UB), lty = 2, col = "blue")
+  
+  points(mothers.result$days, exp(mothers.result$Ec_median), col = "red", pch = 2)
+  lines(mothers.result$days, exp(mothers.result$Ec_median), lwd = 2, col = "red")
+  lines(mothers.result$days, exp(mothers.result$Ec_LB), lty = 2, col = "red")
+  lines(mothers.result$days, exp(mothers.result$Ec_UB), lty = 2, col = "red")
+  
+  
+  # Pups Plot
+  
+  plot(pups.result$days+75, exp(pups.result$EcA_median), xlab = "Days", 
+       ylab = "Treatment Mean", main = "Estimated Group Trajectories - Pups", type = "b", col = "blue", lwd = 2, ylim = c(0,4),xlim = c(0,220))
+  abline(h = seq(0,10,0.5), lty = 2, col = "lightgrey")
+  
+  lines(pups.result$days+75, exp(pups.result$EcA_LB), lty = 2, col = "blue")
+  lines(pups.result$days+75, exp(pups.result$EcA_UB), lty = 2, col = "blue")
+  
+  points(pups.result$days+75, exp(pups.result$Ec_median), col = "red", pch = 2)
+  lines(pups.result$days+75, exp(pups.result$Ec_median), lwd = 2, col = "red")
+  lines(pups.result$days+75, exp(pups.result$Ec_LB), lty = 2, col = "red")
+  lines(pups.result$days+75, exp(pups.result$Ec_UB), lty = 2, col = "red")
+  
+  
+  
+ legend(x=20,y=2, legend = c("EcA", "Ec"), lty = c(1,2),
+           lwd=c(2,2), pch =1:2, col = c("blue", "red"), 
+           cex = 1.5,
+           xjust=0.5, yjust=0.5)
+dev.off()
+
+
+```
